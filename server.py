@@ -46,6 +46,12 @@ def index():
     <button type="button" id="resetBtn" style="padding:8px 16px;background:#c62828;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;">Reset all times</button>
   </p>
   <p style="color:#888;font-size:14px;">Auto-refreshing every 3 seconds. Split by TC. Oldest first.</p>
+  <p style="margin:12px 0 4px 0;">
+    <label for="tcFilter" style="color:#aaa;font-size:14px;">Show entries: </label>
+    <select id="tcFilter" style="padding:6px 10px;background:#2a2a2a;color:#ffb74d;border:1px solid #444;border-radius:6px;font-size:14px;min-width:140px;">
+      <option value="__all__">All TCs</option>
+    </select>
+  </p>
   <p id="lastUpdate" style="color:#666;font-size:12px;margin-top:-8px;">Last updated: --</p>
   <div id="list">
     <div class="empty">No entries yet. Record a time on the app to see it here.</div>
@@ -55,16 +61,17 @@ def index():
       fetch('/entries?t=' + Date.now())
         .then(r => r.json())
         .then(data => {
+          lastData = data;
           document.getElementById('lastUpdate').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-          var list = document.getElementById('list');
+          var tcFilter = document.getElementById('tcFilter');
           if (data.length === 0) {
-            list.innerHTML = '<div class="empty">No entries yet. Record a time on the app to see it here.</div>';
+            document.getElementById('list').innerHTML = '<div class="empty">No entries yet. Record a time on the app to see it here.</div>';
+            tcFilter.innerHTML = '<option value="__all__">All TCs</option>';
             return;
           }
-          function formatTc(tcVal) {
+          function displayTc(tcVal) {
             if (tcVal == null || tcVal === '') return '(No TC)';
-            var s = String(tcVal).trim();
-            return s.toUpperCase().indexOf('TC') === 0 ? s : 'TC' + s;
+            return String(tcVal).trim();
           }
           var byTc = {};
           data.forEach(function(e) {
@@ -73,16 +80,46 @@ def index():
             byTc[key].push(e);
           });
           var tcs = Object.keys(byTc).sort();
-          list.innerHTML = tcs.map(function(tcKey) {
-            var rows = byTc[tcKey].slice().reverse().map(function(e, i) {
-              return '<div class="entry"><span class="num-car">' + (i+1) + '. #' + escapeHtml(String(e.carNumber)) + '</span><span class="time">' + escapeHtml(e.time) + '</span></div>';
-            }).join('');
-            return '<div class="tc-block"><h2 class="tc-title">' + escapeHtml(formatTc(tcKey)) + '</h2>' + rows + '</div>';
+          var currentFilter = tcFilter.value;
+          tcFilter.innerHTML = '<option value="__all__">All TCs</option>' + tcs.map(function(tcKey) {
+            return '<option value="' + escapeHtml(tcKey) + '">' + escapeHtml(displayTc(tcKey)) + '</option>';
           }).join('');
+          if (currentFilter !== '__all__' && tcs.indexOf(currentFilter) >= 0) tcFilter.value = currentFilter;
+          else tcFilter.value = '__all__';
+          renderList(data, tcFilter.value);
         })
         .catch(function() { document.getElementById('lastUpdate').textContent = 'Last updated: (error)'; });
     }
     function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    var lastData = [];
+    function renderList(data, filterTc) {
+      var list = document.getElementById('list');
+      var tcFilter = document.getElementById('tcFilter');
+      if (data.length === 0) {
+        list.innerHTML = '<div class="empty">No entries yet. Record a time on the app to see it here.</div>';
+        return;
+      }
+      function displayTc(tcVal) {
+        if (tcVal == null || tcVal === '') return '(No TC)';
+        return String(tcVal).trim();
+      }
+      var byTc = {};
+      data.forEach(function(e) {
+        var key = (e.tc != null && e.tc !== '') ? String(e.tc).trim() : '';
+        if (!byTc[key]) byTc[key] = [];
+        byTc[key].push(e);
+      });
+      var tcs = Object.keys(byTc).sort();
+      if (filterTc === undefined) filterTc = tcFilter.value;
+      var tcsToShow = (filterTc === '__all__' || filterTc === undefined) ? tcs : [filterTc];
+      list.innerHTML = tcsToShow.map(function(tcKey) {
+        var rows = byTc[tcKey].slice().reverse().map(function(e, i) {
+          return '<div class="entry"><span class="num-car">' + (i+1) + '. #' + escapeHtml(String(e.carNumber)) + '</span><span class="time">' + escapeHtml(e.time) + '</span></div>';
+        }).join('');
+        return '<div class="tc-block"><h2 class="tc-title">' + escapeHtml(displayTc(tcKey)) + '</h2>' + rows + '</div>';
+      }).join('');
+    }
+    document.getElementById('tcFilter').onchange = function() { renderList(lastData, this.value); };
     document.getElementById('resetBtn').onclick = function() {
       if (!confirm('Are you sure you want to delete all times?')) return;
       fetch('/reset-entries', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
