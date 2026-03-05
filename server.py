@@ -10,12 +10,13 @@ app = Flask(__name__, static_folder=None)
 @app.after_request
 def add_cors(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
 
 
 entries = []
+_next_entry_id = 0
 
 
 @app.route("/")
@@ -31,10 +32,22 @@ def index():
     * { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; background: #1a1a1a; color: #ffb74d; margin: 0; padding: 24px; }
     h1 { font-size: 1.5rem; margin-bottom: 16px; }
-    .entry { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #333; font-size: 1.25rem; }
+    .entry { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #333; font-size: 1.25rem; gap: 8px; }
     .entry .num-car { color: #ccc; }
     .entry .time { font-variant-numeric: tabular-nums; color: #ffb74d; }
+    .entry-actions { display: flex; gap: 6px; flex-shrink: 0; }
+    .entry-actions button { padding: 4px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    .entry-actions .edit-btn { background: #555; color: #ffb74d; }
+    .entry-actions .delete-btn { background: #c62828; color: #fff; }
     .empty { color: #666; padding: 24px 0; }
+    .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 100; }
+    .modal { background: #2a2a2a; padding: 20px; border-radius: 8px; min-width: 280px; }
+    .modal label { display: block; color: #aaa; font-size: 12px; margin-top: 10px; margin-bottom: 4px; }
+    .modal input { width: 100%; padding: 8px; background: #1a1a1a; border: 1px solid #444; border-radius: 4px; color: #fff; font-size: 14px; box-sizing: border-box; }
+    .modal-btns { margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end; }
+    .modal-btns button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
+    .modal-btns .save-btn { background: #ffb74d; color: #1a1a1a; }
+    .modal-btns .cancel-btn { background: #555; color: #fff; }
     #list { max-width: 560px; }
     .tc-block { margin-bottom: 24px; }
     .tc-title { font-size: 1.1rem; color: #ffb74d; margin: 0 0 8px 0; padding-bottom: 4px; border-bottom: 1px solid #444; }
@@ -114,11 +127,50 @@ def index():
       var tcsToShow = (filterTc === '__all__' || filterTc === undefined) ? tcs : [filterTc];
       list.innerHTML = tcsToShow.map(function(tcKey) {
         var rows = byTc[tcKey].slice().reverse().map(function(e, i) {
-          return '<div class="entry"><span class="num-car">' + (i+1) + '. #' + escapeHtml(String(e.carNumber)) + '</span><span class="time">' + escapeHtml(e.time) + '</span></div>';
+          var id = e.id != null ? e.id : i;
+          return '<div class="entry" data-id="' + id + '"><span class="num-car">' + (i+1) + '. #' + escapeHtml(String(e.carNumber)) + '</span><span class="time">' + escapeHtml(e.time) + '</span><div class="entry-actions"><button type="button" class="edit-btn" data-id="' + id + '">Edit</button><button type="button" class="delete-btn" data-id="' + id + '">Delete</button></div></div>';
         }).join('');
         return '<div class="tc-block"><h2 class="tc-title">' + escapeHtml(displayTc(tcKey)) + '</h2>' + rows + '</div>';
       }).join('');
     }
+    function findEntryById(id) {
+      var n = parseInt(id, 10);
+      if (isNaN(n)) return null;
+      for (var i = 0; i < lastData.length; i++) {
+        if (lastData[i].id === n || lastData[i].id == id) return lastData[i];
+      }
+      return null;
+    }
+    function showEditModal(entry) {
+      var overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+      var timeVal = entry.time || '';
+      var carVal = String(entry.carNumber != null ? entry.carNumber : '');
+      overlay.innerHTML = '<div class="modal"><h3 style="margin:0 0 12px 0;color:#ffb74d;">Edit entry</h3><label>Car number</label><input type="number" id="editCar" min="0" max="99" value="' + escapeHtml(carVal) + '"><label>Time (e.g. 00:01:23.45)</label><input type="text" id="editTime" value="' + escapeHtml(timeVal) + '"><div class="modal-btns"><button type="button" class="cancel-btn">Cancel</button><button type="button" class="save-btn">Save</button></div></div>';
+      document.body.appendChild(overlay);
+      var editCar = overlay.querySelector('#editCar');
+      var editTime = overlay.querySelector('#editTime');
+      overlay.querySelector('.cancel-btn').onclick = function() { document.body.removeChild(overlay); };
+      overlay.querySelector('.save-btn').onclick = function() {
+        var car = parseInt(editCar.value, 10);
+        if (isNaN(car) || car < 0 || car > 99) { alert('Car number must be 0–99'); return; }
+        var time = editTime.value.trim();
+        fetch('/entry/' + entry.id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ carNumber: car, time: time }) })
+          .then(function(r) { if (r.ok) { document.body.removeChild(overlay); refresh(); } else { alert('Update failed'); } })
+          .catch(function() { alert('Update failed'); });
+      };
+      overlay.onclick = function(ev) { if (ev.target === overlay) document.body.removeChild(overlay); };
+    }
+    document.getElementById('list').addEventListener('click', function(ev) {
+      var btn = ev.target.closest('.edit-btn');
+      if (btn) { var entry = findEntryById(btn.getAttribute('data-id')); if (entry) showEditModal(entry); return; }
+      btn = ev.target.closest('.delete-btn');
+      if (btn) {
+        if (!confirm('Delete this entry?')) return;
+        var id = btn.getAttribute('data-id');
+        fetch('/entry/' + id, { method: 'DELETE' }).then(function(r) { if (r.ok) refresh(); }).catch(function() { alert('Delete failed'); });
+      }
+    });
     document.getElementById('tcFilter').onchange = function() { renderList(lastData, this.value); };
     document.getElementById('resetBtn').onclick = function() {
       if (!confirm('Are you sure you want to delete all times?')) return;
@@ -135,6 +187,10 @@ def index():
 
 @app.route("/entries")
 def get_entries():
+    # Ensure every entry has an id for edit/delete
+    for i, e in enumerate(entries):
+        if "id" not in e:
+            e["id"] = i
     r = jsonify(entries)
     r.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     return r
@@ -142,6 +198,7 @@ def get_entries():
 
 @app.route("/entry", methods=["POST"])
 def add_entry():
+    global _next_entry_id
     data = request.get_json(force=True, silent=True) or {}
     time = str(data.get("time", ""))
     try:
@@ -149,8 +206,38 @@ def add_entry():
     except (TypeError, ValueError):
         car_number = 0
     tc = str(data.get("tc") or "")
-    entries.insert(0, {"time": time, "carNumber": car_number, "tc": tc})
-    return jsonify({"ok": True}), 201
+    entry = {"id": _next_entry_id, "time": time, "carNumber": car_number, "tc": tc}
+    _next_entry_id += 1
+    entries.insert(0, entry)
+    return jsonify({"ok": True, "id": entry["id"]}), 201
+
+
+@app.route("/entry/<int:entry_id>", methods=["PUT"])
+def update_entry(entry_id):
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if entry is None:
+        return jsonify({"error": "Not found"}), 404
+    data = request.get_json(force=True, silent=True) or {}
+    if "time" in data:
+        entry["time"] = str(data["time"])
+    if "carNumber" in data:
+        try:
+            entry["carNumber"] = int(data["carNumber"])
+        except (TypeError, ValueError):
+            pass
+    if "tc" in data:
+        entry["tc"] = str(data["tc"])
+    return jsonify({"ok": True}), 200
+
+
+@app.route("/entry/<int:entry_id>", methods=["DELETE"])
+def delete_entry(entry_id):
+    global entries
+    for i, e in enumerate(entries):
+        if e.get("id") == entry_id:
+            entries.pop(i)
+            return jsonify({"ok": True}), 200
+    return jsonify({"error": "Not found"}), 404
 
 
 @app.route("/reset-entries", methods=["POST"])
