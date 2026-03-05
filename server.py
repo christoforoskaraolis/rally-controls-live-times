@@ -39,6 +39,7 @@ def index():
     .entry-actions button { padding: 4px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
     .entry-actions .edit-btn { background: #555; color: #ffb74d; }
     .entry-actions .delete-btn { background: #c62828; color: #fff; }
+    .entry-actions .move-tc-select { padding: 4px 6px; background: #2a2a2a; color: #ffb74d; border: 1px solid #444; border-radius: 4px; font-size: 12px; cursor: pointer; min-width: 72px; }
     .empty { color: #666; padding: 24px 0; }
     .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 100; }
     .modal { background: #2a2a2a; padding: 20px; border-radius: 8px; min-width: 280px; }
@@ -128,7 +129,12 @@ def index():
       list.innerHTML = tcsToShow.map(function(tcKey) {
         var rows = byTc[tcKey].slice().reverse().map(function(e, i) {
           var id = e.id != null ? e.id : i;
-          return '<div class="entry" data-id="' + id + '"><span class="num-car">' + (i+1) + '. #' + escapeHtml(String(e.carNumber)) + '</span><span class="time">' + escapeHtml(e.time) + '</span><div class="entry-actions"><button type="button" class="edit-btn" data-id="' + id + '">Edit</button><button type="button" class="delete-btn" data-id="' + id + '">Delete</button></div></div>';
+          var currentTc = (e.tc != null && e.tc !== '') ? String(e.tc).trim() : '';
+          var moveOpts = tcs.map(function(tcOpt) {
+            var sel = tcOpt === currentTc ? ' selected' : '';
+            return '<option value="' + escapeHtml(tcOpt) + '"' + sel + '>' + escapeHtml(displayTc(tcOpt)) + '</option>';
+          }).join('');
+          return '<div class="entry" data-id="' + id + '"><span class="num-car">' + (i+1) + '. #' + escapeHtml(String(e.carNumber)) + '</span><span class="time">' + escapeHtml(e.time) + '</span><div class="entry-actions"><select class="move-tc-select" data-id="' + id + '" title="Move to TC">' + moveOpts + '</select><button type="button" class="edit-btn" data-id="' + id + '">Edit</button><button type="button" class="delete-btn" data-id="' + id + '">Delete</button></div></div>';
         }).join('');
         return '<div class="tc-block"><h2 class="tc-title">' + escapeHtml(displayTc(tcKey)) + '</h2>' + rows + '</div>';
       }).join('');
@@ -170,6 +176,19 @@ def index():
         var id = btn.getAttribute('data-id');
         fetch('/entry/' + id, { method: 'DELETE' }).then(function(r) { if (r.ok) refresh(); }).catch(function() { alert('Delete failed'); });
       }
+    });
+    document.getElementById('list').addEventListener('change', function(ev) {
+      var sel = ev.target.closest('.move-tc-select');
+      if (!sel) return;
+      var id = sel.getAttribute('data-id');
+      var entry = findEntryById(id);
+      if (!entry) return;
+      var newTc = sel.value;
+      var currentTc = (entry.tc != null && entry.tc !== '') ? String(entry.tc).trim() : '';
+      if (newTc === currentTc) return;
+      fetch('/entry/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tc: newTc }) })
+        .then(function(r) { if (r.ok) refresh(); else alert('Move failed'); })
+        .catch(function() { alert('Move failed'); });
     });
     document.getElementById('tcFilter').onchange = function() { renderList(lastData, this.value); };
     document.getElementById('resetBtn').onclick = function() {
