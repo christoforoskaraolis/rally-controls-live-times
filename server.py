@@ -31,7 +31,8 @@ penalties = []
 _next_penalty_id = 0
 
 # Ordered time-control program. First item is the rally start (usually TC0).
-# targetMinutesFromPrev: minutes allowed from the previous TC (0 for the start).
+# Each item: controlType (TC|SS), number, code (e.g. TC01), targetMinutesFromPrev,
+# checkPenalties (bool) — if False, no auto penalty for arrival at this control.
 itinerary = []
 _next_itinerary_id = 0
 
@@ -40,6 +41,73 @@ _next_itinerary_id = 0
 
 def normalize_tc(tc) -> str:
     return str(tc or "").strip()
+
+
+def build_control_code(control_type, number) -> str:
+    """Build live-times TC label from type + number, e.g. TC + 01 → TC01."""
+    kind = str(control_type or "TC").strip().upper()
+    if kind not in ("TC", "SS"):
+        kind = "TC"
+    num = str(number or "").strip().upper().replace(" ", "")
+    # Allow values already prefixed (TC01 / SS1)
+    if num.startswith("TC") or num.startswith("SS"):
+        return num
+    return f"{kind}{num}"
+
+
+def parse_bool(value, default=True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def itinerary_item_from_payload(data: dict, *, is_first: bool) -> dict:
+    control_type = str(data.get("controlType") or data.get("type") or "TC").strip().upper()
+    if control_type not in ("TC", "SS"):
+        control_type = "TC"
+    number = str(data.get("number") or "").strip()
+    # Back-compat: allow legacy "code" only
+    code = normalize_tc(data.get("code"))
+    if number:
+        code = build_control_code(control_type, number)
+    elif code:
+        upper = code.upper()
+        if upper.startswith("SS"):
+            control_type = "SS"
+            number = code[2:]
+        elif upper.startswith("TC"):
+            control_type = "TC"
+            number = code[2:]
+        else:
+            number = code
+            code = build_control_code(control_type, number)
+    try:
+        mins = int(data.get("targetMinutesFromPrev", 0))
+    except (TypeError, ValueError):
+        mins = 0
+    if mins < 0:
+        mins = 0
+    if is_first:
+        mins = 0
+    check = parse_bool(data.get("checkPenalties"), default=True)
+    if is_first:
+        # Start control has no inbound leg; keep flag but it is unused until moved.
+        pass
+    return {
+        "controlType": control_type,
+        "number": number,
+        "code": code,
+        "name": str(data.get("name") or ""),
+        "targetMinutesFromPrev": mins,
+        "checkPenalties": check,
+    }
 
 
 def parse_clock(time_str: str):
@@ -171,6 +239,9 @@ def recalculate_auto_penalties():
             target_minutes = 0
         if not prev_code or not curr_code or target_minutes < 0:
             continue
+        # If this control is marked "no", skip penalty checks for arrivals here.
+        if not parse_bool(curr.get("checkPenalties"), default=True):
+            continue
 
         for car in cars:
             prev_t = official_time_for_car_tc(car, prev_code)
@@ -271,7 +342,9 @@ def index():
     .badge-auto { background: #333; color: #ffb74d; }
     .badge-manual { background: #333; color: #aaa; }
     .badge-ok { background: #2e7d32; color: #fff; }
+    .badge-skip { background: #555; color: #ddd; }
     .live-tcs { color: #888; font-size: 12px; margin-bottom: 12px; }
+    .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   </style>
 </head>
 <body>
@@ -327,12 +400,12 @@ def index():
       <button type="button" class="btn btn-danger" id="resetItineraryBtn">Clear itinerary</button>
     </div>
     <div class="rules">
-      Build the rally <strong>time program</strong> in order. The first control is the start
-      (e.g. <strong>TC0</strong> / <strong>TC01</strong>) — no target from a previous control.
-      Each next control has a <strong>target time in minutes from the previous TC</strong>.
-      Example: TC0 → TC1 target <strong>50</strong> minutes. If a car takes 51 minutes, it is
-      1 minute late → <strong>+0:10</strong> penalty. If it arrives 1 minute early → <strong>+1:00</strong> penalty.
-      TC codes must match the TC names used in Live Times.
+      Add controls in order. Choose <strong>TC</strong> or <strong>SS</strong>, then the
+      <strong>number</strong> (e.g. TC + 01 → <strong>TC01</strong>, SS + 1 → <strong>SS1</strong>).
+      Set <strong>target minutes from previous</strong> (not needed for the first/start control).
+      <strong>Check penalties?</strong> Yes = early/late rules apply at this control;
+      No = times are still shown in schedule check, but <em>no auto penalty</em> is created.
+      Labels must match Live Times names.
     </div>
     <p id="liveTcHints" class="live-tcs"></p>
     <div id="itineraryList">
@@ -625,18 +698,26 @@ def index():
     function renderItinerary() {
       var el = document.getElementById('itineraryList');
       if (!lastItinerary.length) {
-        el.innerHTML = '<div class="empty">No itinerary yet. Add the start control (e.g. TC0), then the next TC with target minutes.</div>';
+        el.innerHTML = '<div class="empty">No itinerary yet. Add start control (TC or SS + number), then the next with target minutes.</div>';
         return;
       }
       var rows = lastItinerary.map(function(item, i) {
+        var type = (item.controlType || (String(item.code || '').toUpperCase().indexOf('SS') === 0 ? 'SS' : 'TC'));
+        var num = item.number != null && item.number !== '' ? item.number : String(item.code || '').replace(/^TC|^SS/i, '');
         var targetCell = i === 0
           ? '<span class="muted">Start — no previous target</span>'
           : ('<strong>' + escapeHtml(String(item.targetMinutesFromPrev != null ? item.targetMinutesFromPrev : '')) + ' min</strong> from ' + escapeHtml(lastItinerary[i-1].code || ''));
+        var check = item.checkPenalties !== false;
+        var checkBadge = i === 0
+          ? '<span class="muted">—</span>'
+          : (check ? '<span class="badge badge-ok">YES</span>' : '<span class="badge badge-skip">NO</span>');
         return '<tr data-id="' + item.id + '">' +
           '<td class="muted">' + (i + 1) + '</td>' +
+          '<td class="muted">' + escapeHtml(type) + '</td>' +
+          '<td class="muted">' + escapeHtml(String(num)) + '</td>' +
           '<td><strong>' + escapeHtml(item.code || '') + '</strong></td>' +
-          '<td class="muted">' + escapeHtml(item.name || '') + '</td>' +
           '<td>' + targetCell + '</td>' +
+          '<td>' + checkBadge + '</td>' +
           '<td class="actions">' +
             '<button type="button" class="move-btn it-up" data-id="' + item.id + '" title="Move up">↑</button> ' +
             '<button type="button" class="move-btn it-down" data-id="' + item.id + '" title="Move down">↓</button> ' +
@@ -644,7 +725,7 @@ def index():
             '<button type="button" class="delete-btn it-del" data-id="' + item.id + '">Delete</button>' +
           '</td></tr>';
       }).join('');
-      el.innerHTML = '<table class="data"><thead><tr><th>#</th><th>TC code</th><th>Name</th><th>Target from previous</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
+      el.innerHTML = '<table class="data"><thead><tr><th>#</th><th>Type</th><th>No.</th><th>Label</th><th>Target from previous</th><th>Check penalties</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
     function findItinerary(id) {
       var n = parseInt(id, 10);
@@ -657,32 +738,55 @@ def index():
       var overlay = document.createElement('div');
       overlay.className = 'modal-overlay';
       var isFirst = !existing && lastItinerary.length === 0;
-      var p = existing || { code: isFirst ? 'TC0' : '', name: '', targetMinutesFromPrev: isFirst ? 0 : 50 };
-      var showTarget = existing ? (findItineraryIndex(existing.id) > 0) : !isFirst;
+      var idx = existing ? findItineraryIndex(existing.id) : -1;
+      var showTarget = existing ? (idx > 0) : !isFirst;
+      var type = 'TC';
+      var num = isFirst ? '0' : '';
+      if (existing) {
+        type = existing.controlType || (String(existing.code || '').toUpperCase().indexOf('SS') === 0 ? 'SS' : 'TC');
+        num = existing.number != null && String(existing.number) !== ''
+          ? String(existing.number)
+          : String(existing.code || '').replace(/^TC|^SS/i, '');
+      }
+      var checkYes = !existing || existing.checkPenalties !== false;
+      var p = existing || { name: '', targetMinutesFromPrev: isFirst ? 0 : 50 };
       overlay.innerHTML =
-        '<div class="modal"><h3 style="margin:0 0 12px 0;color:#ffb74d;">' + (existing ? 'Edit time control' : 'Add time control') + '</h3>' +
-        '<label>TC code (must match Live Times, e.g. TC0, TC01, TC1)</label><input type="text" id="itCode" value="' + escapeHtml(p.code || '') + '">' +
+        '<div class="modal"><h3 style="margin:0 0 12px 0;color:#ffb74d;">' + (existing ? 'Edit control' : 'Add control') + '</h3>' +
+        '<div class="row-2">' +
+          '<div><label>Type</label><select id="itType"><option value="TC"' + (type === 'TC' ? ' selected' : '') + '>TC</option><option value="SS"' + (type === 'SS' ? ' selected' : '') + '>SS</option></select></div>' +
+          '<div><label>Number</label><input type="text" id="itNumber" placeholder="e.g. 0, 01, 1, 6A" value="' + escapeHtml(num) + '"></div>' +
+        '</div>' +
         '<label>Name (optional)</label><input type="text" id="itName" value="' + escapeHtml(p.name || '') + '">' +
         (showTarget
-          ? '<label>Target minutes from previous TC</label><input type="number" id="itTargetMin" min="0" step="1" value="' + escapeHtml(String(p.targetMinutesFromPrev != null ? p.targetMinutesFromPrev : 50)) + '">'
-          : '<p class="hint" style="margin-top:12px;">This is the start control — cars get their start time when they punch here.</p><input type="hidden" id="itTargetMin" value="0">') +
+          ? '<label>Target minutes from previous</label><input type="number" id="itTargetMin" min="0" step="1" value="' + escapeHtml(String(p.targetMinutesFromPrev != null ? p.targetMinutesFromPrev : 50)) + '">'
+          : '<p class="hint" style="margin-top:12px;">Start control — cars get their start time when they punch here.</p><input type="hidden" id="itTargetMin" value="0">') +
+        (showTarget
+          ? ('<label>Check penalties for this control?</label><select id="itCheckPen"><option value="yes"' + (checkYes ? ' selected' : '') + '>Yes — apply early/late penalties</option><option value="no"' + (!checkYes ? ' selected' : '') + '>No — do not create penalties</option></select>')
+          : '<input type="hidden" id="itCheckPen" value="no">') +
         '<div class="modal-btns"><button type="button" class="cancel-btn">Cancel</button><button type="button" class="save-btn">Save</button></div></div>';
       document.body.appendChild(overlay);
       overlay.querySelector('.cancel-btn').onclick = function() { document.body.removeChild(overlay); };
       overlay.querySelector('.save-btn').onclick = function() {
-        var code = overlay.querySelector('#itCode').value.trim();
-        if (!code) { alert('TC code is required'); return; }
+        var controlType = overlay.querySelector('#itType').value;
+        var number = overlay.querySelector('#itNumber').value.trim();
+        if (!number) { alert('Number is required'); return; }
         var mins = parseInt(overlay.querySelector('#itTargetMin').value, 10);
         if (isNaN(mins) || mins < 0) mins = 0;
+        var checkPenalties = overlay.querySelector('#itCheckPen').value === 'yes';
         var body = {
-          code: code,
+          controlType: controlType,
+          number: number,
           name: overlay.querySelector('#itName').value.trim(),
-          targetMinutesFromPrev: mins
+          targetMinutesFromPrev: mins,
+          checkPenalties: checkPenalties
         };
         var req = existing
           ? fetch('/itinerary/' + existing.id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
           : fetch('/itinerary', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-        req.then(function(r) { if (r.ok) { document.body.removeChild(overlay); refreshItinerary(); refreshSchedulePreview(); } else alert('Save failed'); });
+        req.then(function(r) {
+          if (r.ok) { document.body.removeChild(overlay); refreshItinerary(); refreshSchedulePreview(); }
+          else r.json().then(function(j) { alert((j && j.error) || 'Save failed'); }).catch(function() { alert('Save failed'); });
+        });
       };
       overlay.onclick = function(ev) { if (ev.target === overlay) document.body.removeChild(overlay); };
     }
@@ -704,6 +808,7 @@ def index():
           var html = rows.map(function(r) {
             var badge = r.kind === 'late' ? '<span class="badge badge-late">LATE ' + r.minutes + 'm</span>'
               : r.kind === 'early' ? '<span class="badge badge-early">EARLY ' + r.minutes + 'm</span>'
+              : r.kind === 'skipped' ? '<span class="badge badge-skip">NO CHECK</span>'
               : '<span class="badge badge-ok">OK</span>';
             return '<tr>' +
               '<td>#' + escapeHtml(String(r.carNumber)) + '</td>' +
@@ -713,7 +818,7 @@ def index():
               '<td>' + escapeHtml(r.targetTime) + '</td>' +
               '<td>' + escapeHtml(r.actualTime) + '</td>' +
               '<td>' + badge + '</td>' +
-              '<td>' + (r.kind === 'ok' ? '—' : escapeHtml(r.penalty)) + '</td>' +
+              '<td>' + (r.kind === 'ok' || r.kind === 'skipped' ? '—' : escapeHtml(r.penalty)) + '</td>' +
               '</tr>';
           }).join('');
           el.innerHTML = '<table class="data"><thead><tr><th>Car</th><th>Leg</th><th>Target</th><th>Prev punch</th><th>Due</th><th>Actual</th><th>Status</th><th>Penalty</th></tr></thead><tbody>' + html + '</tbody></table>';
@@ -918,21 +1023,11 @@ def get_itinerary():
 def add_itinerary():
     global _next_itinerary_id
     data = request.get_json(force=True, silent=True) or {}
-    try:
-        mins = int(data.get("targetMinutesFromPrev", 0))
-    except (TypeError, ValueError):
-        mins = 0
-    if mins < 0:
-        mins = 0
-    # First control is always start (0 minutes from previous)
-    if not itinerary:
-        mins = 0
-    item = {
-        "id": _next_itinerary_id,
-        "code": normalize_tc(data.get("code")),
-        "name": str(data.get("name") or ""),
-        "targetMinutesFromPrev": mins,
-    }
+    is_first = not itinerary
+    item = itinerary_item_from_payload(data, is_first=is_first)
+    if not item["code"]:
+        return jsonify({"error": "Control type and number are required"}), 400
+    item["id"] = _next_itinerary_id
     _next_itinerary_id += 1
     itinerary.append(item)
     recalculate_auto_penalties()
@@ -945,19 +1040,23 @@ def update_itinerary(item_id):
     if item is None:
         return jsonify({"error": "Not found"}), 404
     data = request.get_json(force=True, silent=True) or {}
-    if "code" in data:
-        item["code"] = normalize_tc(data["code"])
-    if "name" in data:
-        item["name"] = str(data["name"])
-    if "targetMinutesFromPrev" in data:
-        try:
-            mins = int(data["targetMinutesFromPrev"])
-        except (TypeError, ValueError):
-            mins = 0
-        if mins < 0:
-            mins = 0
-        idx = next(i for i, x in enumerate(itinerary) if x.get("id") == item_id)
-        item["targetMinutesFromPrev"] = 0 if idx == 0 else mins
+    idx = next(i for i, x in enumerate(itinerary) if x.get("id") == item_id)
+    merged = {
+        "controlType": data.get("controlType", item.get("controlType", "TC")),
+        "number": data.get("number", item.get("number", "")),
+        "code": data.get("code", item.get("code", "")),
+        "name": data.get("name", item.get("name", "")),
+        "targetMinutesFromPrev": data.get(
+            "targetMinutesFromPrev", item.get("targetMinutesFromPrev", 0)
+        ),
+        "checkPenalties": data.get(
+            "checkPenalties", item.get("checkPenalties", True)
+        ),
+    }
+    updated = itinerary_item_from_payload(merged, is_first=(idx == 0))
+    if not updated["code"]:
+        return jsonify({"error": "Control type and number are required"}), 400
+    item.update(updated)
     recalculate_auto_penalties()
     return jsonify({"ok": True}), 200
 
@@ -1016,10 +1115,28 @@ def schedule_check():
             target_minutes = int(curr.get("targetMinutesFromPrev") or 0)
         except (TypeError, ValueError):
             target_minutes = 0
+        check = parse_bool(curr.get("checkPenalties"), default=True)
         for car in cars:
             prev_t = official_time_for_car_tc(car, prev_code)
             curr_t = official_time_for_car_tc(car, curr_code)
             if prev_t is None or curr_t is None:
+                continue
+            if not check:
+                target_arrival = prev_t + timedelta(minutes=int(target_minutes))
+                rows.append({
+                    "carNumber": car,
+                    "fromTc": prev_code,
+                    "toTc": curr_code,
+                    "targetMinutes": target_minutes,
+                    "prevTime": format_clock(prev_t),
+                    "targetTime": format_clock(target_arrival),
+                    "actualTime": format_clock(curr_t),
+                    "kind": "skipped",
+                    "minutes": 0,
+                    "penalty": "—",
+                    "reason": "Penalty check disabled for this control",
+                    "checkPenalties": False,
+                })
                 continue
             result = compute_leg_penalty(prev_t, curr_t, target_minutes)
             rows.append({
@@ -1034,6 +1151,7 @@ def schedule_check():
                 "minutes": result["minutes"],
                 "penalty": result["penalty"],
                 "reason": result["reason"],
+                "checkPenalties": True,
             })
     r = jsonify(rows)
     r.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"

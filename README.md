@@ -8,10 +8,13 @@ Web server for the Rally Control Timer app. Tabs:
 
 ## Itinerary & penalties
 
-1. In **ITINERARY**, add the start control first (e.g. `TC0` / `TC01`).
-2. Add the next control with **target minutes from previous** (e.g. `TC1` = 50).
-3. TC codes must match the TC names used in Live Times.
-4. Click **Recalculate penalties** (or it runs when times/itinerary change).
+1. In **ITINERARY**, add controls in order.
+2. For each control choose **TC** or **SS**, then the **number** (e.g. TC + `01` → `TC01`).
+3. Set **target minutes from previous** (not for the first/start control).
+4. Set **Check penalties?**  
+   - **Yes** — early/late auto penalties apply at this control  
+   - **No** — no auto penalty for this control  
+5. Labels must match Live Times names. Click **Recalculate penalties** anytime.
 
 Rules:
 
