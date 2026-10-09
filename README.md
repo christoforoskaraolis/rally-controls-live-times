@@ -1,6 +1,10 @@
 # Rally Controls Live Times
 
-Web server for the Rally Control Timer app. One page: live times by TC, reset button.
+Web server for the Rally Control Timer app. Tabs:
+
+1. **LIVE TIMES** – times from the marshal app, split by TC  
+2. **PENALTY LIST** – add / edit / clear car penalties  
+3. **ITINERARY** – event controls / stages list
 
 ## Deploy on Railway
 
