@@ -18,9 +18,12 @@ Web server for the Rally Control Timer app. Tabs:
 
 Rules:
 
-- **Late:** 10 seconds penalty per full minute late  
-- **Early:** 1 minute penalty per full minute early  
-- Less than 1 full minute early/late = on time (no auto penalty)
+- Only **HH:MM** counts (seconds and tenths ignored)  
+- **Late:** 10 seconds penalty per minute late  
+- **Early:** 1 minute penalty per minute early  
+- Same minute as due time = on time (no auto penalty)  
+  Example: TC0 `15:36` + 2 min → due `15:38`; TC1 `15:38` = OK.  
+  TC0 `15:37` + 2 min → due `15:39`; TC1 `15:38` = 1 min early → `+1:00`
 
 ## Deploy on Railway
 

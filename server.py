@@ -128,12 +128,14 @@ def parse_clock(time_str: str):
     return None
 
 
+def truncate_to_minute(dt: datetime) -> datetime:
+    """Rally timing: seconds and tenths do not count — only HH:MM."""
+    return datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, 0, 0)
+
+
 def format_clock(dt: datetime) -> str:
-    if dt.microsecond:
-        # hundredths
-        hundredths = dt.microsecond // 10000
-        return f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}.{hundredths:02d}"
-    return f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+    """Display HH:MM for schedule/penalty math (seconds ignored)."""
+    return f"{dt.hour:02d}:{dt.minute:02d}"
 
 
 def format_penalty_duration(total_seconds: int) -> str:
@@ -147,7 +149,7 @@ def format_penalty_duration(total_seconds: int) -> str:
 
 
 def official_time_for_car_tc(car_number: int, tc_code: str):
-    """Earliest recorded time for this car at this TC (case-insensitive TC match)."""
+    """Earliest recorded time for this car at this TC, truncated to the minute."""
     want = normalize_tc(tc_code).lower()
     times = []
     for e in entries:
@@ -157,7 +159,7 @@ def official_time_for_car_tc(car_number: int, tc_code: str):
             continue
         dt = parse_clock(e.get("time", ""))
         if dt is not None:
-            times.append(dt)
+            times.append(truncate_to_minute(dt))
     if not times:
         return None
     return min(times)
@@ -165,19 +167,24 @@ def official_time_for_car_tc(car_number: int, tc_code: str):
 
 def compute_leg_penalty(prev_time: datetime, actual_time: datetime, target_minutes: int):
     """
-    Returns dict with delta details, or None if on time (less than 1 full minute early/late).
-    Late  : 10 seconds penalty per full minute late
-    Early : 1 minute penalty per full minute early
+    Compare whole minutes only (seconds/tenths ignored).
+
+    Example: TC0 15:36:31 → 15:36, target 2 min → due 15:38.
+    Actual TC1 15:38:01 → 15:38 → on time.
+
+    Late  : 10 seconds penalty per minute late
+    Early : 1 minute penalty per minute early
     """
-    target_arrival = prev_time + timedelta(minutes=int(target_minutes))
+    prev_m = truncate_to_minute(prev_time)
+    actual_m = truncate_to_minute(actual_time)
+    target_arrival = prev_m + timedelta(minutes=int(target_minutes))
     # Handle simple overnight wrap if actual looks earlier but was next day
-    actual = actual_time
+    actual = actual_m
     if actual + timedelta(hours=12) < target_arrival:
         actual = actual + timedelta(days=1)
-    delta = actual - target_arrival
-    delta_seconds = int(delta.total_seconds())
-    if delta_seconds >= 60:
-        minutes_late = delta_seconds // 60
+    delta_minutes = int((actual - target_arrival).total_seconds()) // 60
+    if delta_minutes >= 1:
+        minutes_late = delta_minutes
         penalty_seconds = minutes_late * 10
         return {
             "kind": "late",
@@ -185,11 +192,11 @@ def compute_leg_penalty(prev_time: datetime, actual_time: datetime, target_minut
             "penaltySeconds": penalty_seconds,
             "penalty": format_penalty_duration(penalty_seconds),
             "targetTime": format_clock(target_arrival),
-            "actualTime": format_clock(actual_time),
+            "actualTime": format_clock(actual_m),
             "reason": f"Late {minutes_late} min at control (10s per min)",
         }
-    if delta_seconds <= -60:
-        minutes_early = (-delta_seconds) // 60
+    if delta_minutes <= -1:
+        minutes_early = -delta_minutes
         penalty_seconds = minutes_early * 60
         return {
             "kind": "early",
@@ -197,7 +204,7 @@ def compute_leg_penalty(prev_time: datetime, actual_time: datetime, target_minut
             "penaltySeconds": penalty_seconds,
             "penalty": format_penalty_duration(penalty_seconds),
             "targetTime": format_clock(target_arrival),
-            "actualTime": format_clock(actual_time),
+            "actualTime": format_clock(actual_m),
             "reason": f"Early {minutes_early} min at control (1 min per min)",
         }
     return {
@@ -206,7 +213,7 @@ def compute_leg_penalty(prev_time: datetime, actual_time: datetime, target_minut
         "penaltySeconds": 0,
         "penalty": "+0:00",
         "targetTime": format_clock(target_arrival),
-        "actualTime": format_clock(actual_time),
+        "actualTime": format_clock(actual_m),
         "reason": "On time",
     }
 
@@ -1121,16 +1128,18 @@ def schedule_check():
             curr_t = official_time_for_car_tc(car, curr_code)
             if prev_t is None or curr_t is None:
                 continue
+            prev_m = truncate_to_minute(prev_t)
+            curr_m = truncate_to_minute(curr_t)
             if not check:
-                target_arrival = prev_t + timedelta(minutes=int(target_minutes))
+                target_arrival = prev_m + timedelta(minutes=int(target_minutes))
                 rows.append({
                     "carNumber": car,
                     "fromTc": prev_code,
                     "toTc": curr_code,
                     "targetMinutes": target_minutes,
-                    "prevTime": format_clock(prev_t),
+                    "prevTime": format_clock(prev_m),
                     "targetTime": format_clock(target_arrival),
-                    "actualTime": format_clock(curr_t),
+                    "actualTime": format_clock(curr_m),
                     "kind": "skipped",
                     "minutes": 0,
                     "penalty": "—",
@@ -1138,13 +1147,13 @@ def schedule_check():
                     "checkPenalties": False,
                 })
                 continue
-            result = compute_leg_penalty(prev_t, curr_t, target_minutes)
+            result = compute_leg_penalty(prev_m, curr_m, target_minutes)
             rows.append({
                 "carNumber": car,
                 "fromTc": prev_code,
                 "toTc": curr_code,
                 "targetMinutes": target_minutes,
-                "prevTime": format_clock(prev_t),
+                "prevTime": format_clock(prev_m),
                 "targetTime": result["targetTime"],
                 "actualTime": result["actualTime"],
                 "kind": result["kind"],
