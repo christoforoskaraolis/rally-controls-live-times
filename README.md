@@ -3,8 +3,21 @@
 Web server for the Rally Control Timer app. Tabs:
 
 1. **LIVE TIMES** – times from the marshal app, split by TC  
-2. **PENALTY LIST** – add / edit / clear car penalties  
-3. **ITINERARY** – event controls / stages list
+2. **PENALTY LIST** – manual + automatic early/late penalties  
+3. **ITINERARY** – rally time program (TC sequence + target minutes)
+
+## Itinerary & penalties
+
+1. In **ITINERARY**, add the start control first (e.g. `TC0` / `TC01`).
+2. Add the next control with **target minutes from previous** (e.g. `TC1` = 50).
+3. TC codes must match the TC names used in Live Times.
+4. Click **Recalculate penalties** (or it runs when times/itinerary change).
+
+Rules:
+
+- **Late:** 10 seconds penalty per full minute late  
+- **Early:** 1 minute penalty per full minute early  
+- Less than 1 full minute early/late = on time (no auto penalty)
 
 ## Deploy on Railway
 

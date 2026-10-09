@@ -1,8 +1,17 @@
 """
 Rally Controls Live Times – web server for the Rally Control Timer app.
+
+Itinerary = ordered time controls (TC0, TC1, …) with target minutes between them.
+Penalties are calculated from live times:
+  - Late:  10 seconds per full minute late
+  - Early: 1 minute per full minute early
 """
+from __future__ import annotations
+
 from flask import Flask, request, jsonify
 import os
+import re
+from datetime import datetime, timedelta
 
 app = Flask(__name__, static_folder=None)
 
@@ -21,13 +30,179 @@ _next_entry_id = 0
 penalties = []
 _next_penalty_id = 0
 
+# Ordered time-control program. First item is the rally start (usually TC0).
+# targetMinutesFromPrev: minutes allowed from the previous TC (0 for the start).
 itinerary = []
 _next_itinerary_id = 0
 
 
+# ---------- Time / penalty helpers ----------
+
+def normalize_tc(tc) -> str:
+    return str(tc or "").strip()
+
+
+def parse_clock(time_str: str):
+    """Parse HH:MM:SS or HH:MM:SS.xx into a datetime on a fixed reference day."""
+    if not time_str:
+        return None
+    s = str(time_str).strip()
+    # Allow optional date prefix "YYYY-MM-DD HH:MM:SS..."
+    if " " in s and re.match(r"^\d{4}-\d{2}-\d{2}\s", s):
+        s = s.split(" ", 1)[1]
+    s = s.replace(",", ".")
+    for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
+        try:
+            t = datetime.strptime(s, fmt)
+            return datetime(2000, 1, 1, t.hour, t.minute, t.second, t.microsecond)
+        except ValueError:
+            continue
+    return None
+
+
+def format_clock(dt: datetime) -> str:
+    if dt.microsecond:
+        # hundredths
+        hundredths = dt.microsecond // 10000
+        return f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}.{hundredths:02d}"
+    return f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+
+
+def format_penalty_duration(total_seconds: int) -> str:
+    if total_seconds < 0:
+        total_seconds = 0
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"+{hours}:{minutes:02d}:{seconds:02d}"
+    return f"+{minutes}:{seconds:02d}"
+
+
+def official_time_for_car_tc(car_number: int, tc_code: str):
+    """Earliest recorded time for this car at this TC (case-insensitive TC match)."""
+    want = normalize_tc(tc_code).lower()
+    times = []
+    for e in entries:
+        if int(e.get("carNumber", -1)) != int(car_number):
+            continue
+        if normalize_tc(e.get("tc")).lower() != want:
+            continue
+        dt = parse_clock(e.get("time", ""))
+        if dt is not None:
+            times.append(dt)
+    if not times:
+        return None
+    return min(times)
+
+
+def compute_leg_penalty(prev_time: datetime, actual_time: datetime, target_minutes: int):
+    """
+    Returns dict with delta details, or None if on time (less than 1 full minute early/late).
+    Late  : 10 seconds penalty per full minute late
+    Early : 1 minute penalty per full minute early
+    """
+    target_arrival = prev_time + timedelta(minutes=int(target_minutes))
+    # Handle simple overnight wrap if actual looks earlier but was next day
+    actual = actual_time
+    if actual + timedelta(hours=12) < target_arrival:
+        actual = actual + timedelta(days=1)
+    delta = actual - target_arrival
+    delta_seconds = int(delta.total_seconds())
+    if delta_seconds >= 60:
+        minutes_late = delta_seconds // 60
+        penalty_seconds = minutes_late * 10
+        return {
+            "kind": "late",
+            "minutes": minutes_late,
+            "penaltySeconds": penalty_seconds,
+            "penalty": format_penalty_duration(penalty_seconds),
+            "targetTime": format_clock(target_arrival),
+            "actualTime": format_clock(actual_time),
+            "reason": f"Late {minutes_late} min at control (10s per min)",
+        }
+    if delta_seconds <= -60:
+        minutes_early = (-delta_seconds) // 60
+        penalty_seconds = minutes_early * 60
+        return {
+            "kind": "early",
+            "minutes": minutes_early,
+            "penaltySeconds": penalty_seconds,
+            "penalty": format_penalty_duration(penalty_seconds),
+            "targetTime": format_clock(target_arrival),
+            "actualTime": format_clock(actual_time),
+            "reason": f"Early {minutes_early} min at control (1 min per min)",
+        }
+    return {
+        "kind": "ok",
+        "minutes": 0,
+        "penaltySeconds": 0,
+        "penalty": "+0:00",
+        "targetTime": format_clock(target_arrival),
+        "actualTime": format_clock(actual_time),
+        "reason": "On time",
+    }
+
+
+def recalculate_auto_penalties():
+    """
+    Rebuild automatic itinerary penalties from live times + itinerary.
+    Manual penalties (source != 'auto') are kept.
+    """
+    global penalties, _next_penalty_id
+    manual = [p for p in penalties if p.get("source") != "auto"]
+    auto = []
+
+    if len(itinerary) < 2:
+        penalties = manual
+        return {"ok": True, "autoCount": 0, "checked": 0, "message": "Need at least 2 controls in itinerary"}
+
+    checked = 0
+    # Collect cars that appear in live times
+    cars = sorted({int(e.get("carNumber", 0)) for e in entries})
+
+    for i in range(1, len(itinerary)):
+        prev = itinerary[i - 1]
+        curr = itinerary[i]
+        prev_code = normalize_tc(prev.get("code"))
+        curr_code = normalize_tc(curr.get("code"))
+        try:
+            target_minutes = int(curr.get("targetMinutesFromPrev") or 0)
+        except (TypeError, ValueError):
+            target_minutes = 0
+        if not prev_code or not curr_code or target_minutes < 0:
+            continue
+
+        for car in cars:
+            prev_t = official_time_for_car_tc(car, prev_code)
+            curr_t = official_time_for_car_tc(car, curr_code)
+            if prev_t is None or curr_t is None:
+                continue
+            checked += 1
+            result = compute_leg_penalty(prev_t, curr_t, target_minutes)
+            if result is None or result["kind"] == "ok":
+                continue
+            auto.append({
+                "id": _next_penalty_id,
+                "carNumber": car,
+                "penalty": result["penalty"],
+                "tc": curr_code,
+                "reason": result["reason"],
+                "kind": result["kind"],
+                "source": "auto",
+                "fromTc": prev_code,
+                "targetTime": result["targetTime"],
+                "actualTime": result["actualTime"],
+                "targetMinutes": target_minutes,
+            })
+            _next_penalty_id += 1
+
+    penalties = manual + auto
+    return {"ok": True, "autoCount": len(auto), "checked": checked}
+
+
 @app.route("/")
 def index():
-    return """
+    return r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -52,9 +227,10 @@ def index():
     .entry .num-car { color: #ccc; }
     .entry .time { font-variant-numeric: tabular-nums; color: #ffb74d; }
     .entry-actions { display: flex; gap: 6px; flex-shrink: 0; flex-wrap: wrap; }
-    .entry-actions button { padding: 4px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
-    .entry-actions .edit-btn { background: #555; color: #ffb74d; }
-    .entry-actions .delete-btn { background: #c62828; color: #fff; }
+    .entry-actions button, table.data button { padding: 4px 10px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    .edit-btn { background: #555; color: #ffb74d; }
+    .delete-btn { background: #c62828; color: #fff; }
+    .move-btn { background: #333; color: #ffb74d; }
     .entry-actions .move-tc-select { padding: 4px 6px; background: #2a2a2a; color: #ffb74d; border: 1px solid #444; border-radius: 4px; font-size: 12px; cursor: pointer; min-width: 72px; }
     .empty { color: #666; padding: 24px 0; }
     .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 100; }
@@ -64,26 +240,38 @@ def index():
       width: 100%; padding: 8px; background: #1a1a1a; border: 1px solid #444; border-radius: 4px;
       color: #fff; font-size: 14px; box-sizing: border-box; font-family: inherit;
     }
-    .modal textarea { min-height: 72px; resize: vertical; }
     .modal-btns { margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end; }
     .modal-btns button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
     .modal-btns .save-btn { background: #ffb74d; color: #1a1a1a; }
     .modal-btns .cancel-btn { background: #555; color: #fff; }
-    #list, #penaltyList, #itineraryList { max-width: 720px; }
+    #list, #penaltyList, #itineraryList, #schedulePreview { max-width: 920px; }
     .tc-block { margin-bottom: 24px; }
     .tc-title { font-size: 1.1rem; color: #ffb74d; margin: 0 0 8px 0; padding-bottom: 4px; border-bottom: 1px solid #444; }
     .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
     .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
     .btn-danger { background: #c62828; color: #fff; }
     .btn-primary { background: #ffb74d; color: #1a1a1a; font-weight: 700; }
-    .hint { color: #888; font-size: 14px; margin: 0 0 12px 0; }
+    .btn-secondary { background: #444; color: #ffb74d; }
+    .hint { color: #888; font-size: 14px; margin: 0 0 12px 0; line-height: 1.45; }
     .meta { color: #666; font-size: 12px; margin: 0 0 12px 0; }
-    table.data { width: 100%; border-collapse: collapse; max-width: 720px; }
+    .rules {
+      background: #222; border: 1px solid #333; border-radius: 8px; padding: 12px 14px;
+      color: #ccc; font-size: 13px; margin-bottom: 14px; max-width: 920px; line-height: 1.5;
+    }
+    .rules strong { color: #ffb74d; }
+    table.data { width: 100%; border-collapse: collapse; }
     table.data th, table.data td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #333; vertical-align: top; }
     table.data th { color: #aaa; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
     table.data td { color: #ffb74d; font-size: 15px; }
     table.data td.muted { color: #ccc; }
     table.data td.actions { white-space: nowrap; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+    .badge-late { background: #c62828; color: #fff; }
+    .badge-early { background: #ef6c00; color: #fff; }
+    .badge-auto { background: #333; color: #ffb74d; }
+    .badge-manual { background: #333; color: #aaa; }
+    .badge-ok { background: #2e7d32; color: #fff; }
+    .live-tcs { color: #888; font-size: 12px; margin-bottom: 12px; }
   </style>
 </head>
 <body>
@@ -117,9 +305,15 @@ def index():
   <section id="panel-penalties" class="tab-panel" role="tabpanel" hidden>
     <div class="toolbar">
       <button type="button" class="btn btn-primary" id="addPenaltyBtn">Add penalty</button>
-      <button type="button" class="btn btn-danger" id="resetPenaltiesBtn">Clear penalties</button>
+      <button type="button" class="btn btn-secondary" id="recalcPenaltiesBtn">Recalculate from itinerary</button>
+      <button type="button" class="btn btn-danger" id="resetPenaltiesBtn">Clear auto penalties</button>
     </div>
-    <p class="hint">Track time penalties by car. Saved on this server (in memory until restart).</p>
+    <div class="rules">
+      <strong>Auto rules:</strong> Late = <strong>10 seconds</strong> per full minute late.
+      Early = <strong>1 minute</strong> per full minute early.
+      Manual penalties are kept when recalculating.
+    </div>
+    <p id="penaltyStatus" class="meta"></p>
     <div id="penaltyList">
       <div class="empty">No penalties yet.</div>
     </div>
@@ -128,19 +322,30 @@ def index():
   <!-- ITINERARY -->
   <section id="panel-itinerary" class="tab-panel" role="tabpanel" hidden>
     <div class="toolbar">
-      <button type="button" class="btn btn-primary" id="addItineraryBtn">Add item</button>
+      <button type="button" class="btn btn-primary" id="addItineraryBtn">Add time control</button>
+      <button type="button" class="btn btn-secondary" id="recalcFromItineraryBtn">Recalculate penalties</button>
       <button type="button" class="btn btn-danger" id="resetItineraryBtn">Clear itinerary</button>
     </div>
-    <p class="hint">Event itinerary: controls, stages, distances and notes.</p>
-    <div id="itineraryList">
-      <div class="empty">No itinerary items yet.</div>
+    <div class="rules">
+      Build the rally <strong>time program</strong> in order. The first control is the start
+      (e.g. <strong>TC0</strong> / <strong>TC01</strong>) — no target from a previous control.
+      Each next control has a <strong>target time in minutes from the previous TC</strong>.
+      Example: TC0 → TC1 target <strong>50</strong> minutes. If a car takes 51 minutes, it is
+      1 minute late → <strong>+0:10</strong> penalty. If it arrives 1 minute early → <strong>+1:00</strong> penalty.
+      TC codes must match the TC names used in Live Times.
     </div>
+    <p id="liveTcHints" class="live-tcs"></p>
+    <div id="itineraryList">
+      <div class="empty">No itinerary yet. Add TC0 (start), then TC1 with target minutes.</div>
+    </div>
+    <h2 style="margin-top:28px;font-size:1.1rem;">Schedule check (from live times)</h2>
+    <p class="hint">Shows target vs actual for each car between consecutive itinerary controls.</p>
+    <div id="schedulePreview"><div class="empty">Set itinerary and record times to preview.</div></div>
   </section>
 
   <script>
     function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
 
-    /* ---------- Tabs ---------- */
     function showTab(name) {
       document.querySelectorAll('.tab').forEach(function(btn) {
         var on = btn.getAttribute('data-tab') === name;
@@ -154,13 +359,13 @@ def index():
         else panel.setAttribute('hidden', '');
       });
       if (name === 'penalties') refreshPenalties();
-      if (name === 'itinerary') refreshItinerary();
+      if (name === 'itinerary') { refreshItinerary(); refreshSchedulePreview(); refreshLiveTcHints(); }
     }
     document.querySelectorAll('.tab').forEach(function(btn) {
       btn.addEventListener('click', function() { showTab(btn.getAttribute('data-tab')); });
     });
 
-    /* ---------- Live times (existing behaviour) ---------- */
+    /* ---------- Live times ---------- */
     var lastData = [];
     function refresh() {
       fetch('/entries?t=' + Date.now())
@@ -192,6 +397,10 @@ def index():
           if (currentFilter !== '__all__' && tcs.indexOf(currentFilter) >= 0) tcFilter.value = currentFilter;
           else tcFilter.value = '__all__';
           renderList(data, tcFilter.value);
+          if (document.getElementById('panel-itinerary').classList.contains('active')) {
+            refreshLiveTcHints();
+            refreshSchedulePreview();
+          }
         })
         .catch(function() { document.getElementById('lastUpdate').textContent = 'Last updated: (error)'; });
     }
@@ -243,13 +452,11 @@ def index():
       var carVal = String(entry.carNumber != null ? entry.carNumber : '');
       overlay.innerHTML = '<div class="modal"><h3 style="margin:0 0 12px 0;color:#ffb74d;">Edit entry</h3><label>Car number</label><input type="number" id="editCar" min="0" max="99" value="' + escapeHtml(carVal) + '"><label>Time (e.g. 00:01:23.45)</label><input type="text" id="editTime" value="' + escapeHtml(timeVal) + '"><div class="modal-btns"><button type="button" class="cancel-btn">Cancel</button><button type="button" class="save-btn">Save</button></div></div>';
       document.body.appendChild(overlay);
-      var editCar = overlay.querySelector('#editCar');
-      var editTime = overlay.querySelector('#editTime');
       overlay.querySelector('.cancel-btn').onclick = function() { document.body.removeChild(overlay); };
       overlay.querySelector('.save-btn').onclick = function() {
-        var car = parseInt(editCar.value, 10);
+        var car = parseInt(overlay.querySelector('#editCar').value, 10);
         if (isNaN(car) || car < 0 || car > 99) { alert('Car number must be 0–99'); return; }
-        var time = editTime.value.trim();
+        var time = overlay.querySelector('#editTime').value.trim();
         fetch('/entry/' + entry.id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ carNumber: car, time: time }) })
           .then(function(r) { if (r.ok) { document.body.removeChild(overlay); refresh(); } else { alert('Update failed'); } })
           .catch(function() { alert('Update failed'); });
@@ -262,28 +469,25 @@ def index():
       btn = ev.target.closest('.delete-btn');
       if (btn) {
         if (!confirm('Delete this entry?')) return;
-        var id = btn.getAttribute('data-id');
-        fetch('/entry/' + id, { method: 'DELETE' }).then(function(r) { if (r.ok) refresh(); }).catch(function() { alert('Delete failed'); });
+        fetch('/entry/' + btn.getAttribute('data-id'), { method: 'DELETE' }).then(function(r) { if (r.ok) refresh(); });
       }
     });
     document.getElementById('list').addEventListener('change', function(ev) {
       var sel = ev.target.closest('.move-tc-select');
       if (!sel) return;
-      var id = sel.getAttribute('data-id');
-      var entry = findEntryById(id);
+      var entry = findEntryById(sel.getAttribute('data-id'));
       if (!entry) return;
       var newTc = sel.value;
       var currentTc = (entry.tc != null && entry.tc !== '') ? String(entry.tc).trim() : '';
       if (newTc === currentTc) return;
-      fetch('/entry/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tc: newTc }) })
-        .then(function(r) { if (r.ok) refresh(); else alert('Move failed'); })
-        .catch(function() { alert('Move failed'); });
+      fetch('/entry/' + entry.id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tc: newTc }) })
+        .then(function(r) { if (r.ok) refresh(); else alert('Move failed'); });
     });
     document.getElementById('tcFilter').onchange = function() { renderList(lastData, this.value); };
     document.getElementById('resetBtn').onclick = function() {
       if (!confirm('Are you sure you want to delete all times?')) return;
       fetch('/reset-entries', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
-        .then(function(r) { if (r.ok) refresh(); }).catch(function() { alert('Reset failed'); });
+        .then(function(r) { if (r.ok) refresh(); });
     };
 
     /* ---------- Penalties ---------- */
@@ -302,21 +506,29 @@ def index():
     function renderPenalties() {
       var el = document.getElementById('penaltyList');
       if (!lastPenalties.length) {
-        el.innerHTML = '<div class="empty">No penalties yet.</div>';
+        el.innerHTML = '<div class="empty">No penalties yet. Set the itinerary, then recalculate.</div>';
         return;
       }
       var rows = lastPenalties.map(function(p, i) {
+        var kind = p.kind || '';
+        var kindBadge = kind === 'late' ? '<span class="badge badge-late">LATE</span>'
+          : kind === 'early' ? '<span class="badge badge-early">EARLY</span>' : '';
+        var srcBadge = p.source === 'auto'
+          ? '<span class="badge badge-auto">AUTO</span>'
+          : '<span class="badge badge-manual">MANUAL</span>';
         return '<tr data-id="' + p.id + '">' +
           '<td class="muted">' + (i + 1) + '</td>' +
           '<td>#' + escapeHtml(String(p.carNumber)) + '</td>' +
           '<td>' + escapeHtml(p.penalty || '') + '</td>' +
           '<td class="muted">' + escapeHtml(p.tc || '') + '</td>' +
           '<td class="muted">' + escapeHtml(p.reason || '') + '</td>' +
-          '<td class="actions"><button type="button" class="edit-btn pen-edit" data-id="' + p.id + '">Edit</button> ' +
-          '<button type="button" class="delete-btn pen-del" data-id="' + p.id + '">Delete</button></td>' +
+          '<td>' + kindBadge + ' ' + srcBadge + '</td>' +
+          '<td class="actions">' +
+            (p.source === 'auto' ? '' : '<button type="button" class="edit-btn pen-edit" data-id="' + p.id + '">Edit</button> ') +
+            '<button type="button" class="delete-btn pen-del" data-id="' + p.id + '">Delete</button></td>' +
           '</tr>';
       }).join('');
-      el.innerHTML = '<table class="data"><thead><tr><th>#</th><th>Car</th><th>Penalty</th><th>TC / Stage</th><th>Reason</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
+      el.innerHTML = '<table class="data"><thead><tr><th>#</th><th>Car</th><th>Penalty</th><th>TC</th><th>Reason</th><th>Type</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
     function findPenalty(id) {
       var n = parseInt(id, 10);
@@ -332,7 +544,7 @@ def index():
       overlay.innerHTML =
         '<div class="modal"><h3 style="margin:0 0 12px 0;color:#ffb74d;">' + (existing ? 'Edit penalty' : 'Add penalty') + '</h3>' +
         '<label>Car number</label><input type="number" id="penCar" min="0" max="99" value="' + escapeHtml(String(p.carNumber != null ? p.carNumber : '')) + '">' +
-        '<label>Penalty (e.g. +0:10 or 10s)</label><input type="text" id="penVal" value="' + escapeHtml(p.penalty || '') + '">' +
+        '<label>Penalty (e.g. +0:10 or +1:00)</label><input type="text" id="penVal" value="' + escapeHtml(p.penalty || '') + '">' +
         '<label>TC / Stage</label><input type="text" id="penTc" value="' + escapeHtml(p.tc || '') + '">' +
         '<label>Reason</label><input type="text" id="penReason" value="' + escapeHtml(p.reason || '') + '">' +
         '<div class="modal-btns"><button type="button" class="cancel-btn">Cancel</button><button type="button" class="save-btn">Save</button></div></div>';
@@ -345,20 +557,35 @@ def index():
           carNumber: car,
           penalty: overlay.querySelector('#penVal').value.trim(),
           tc: overlay.querySelector('#penTc').value.trim(),
-          reason: overlay.querySelector('#penReason').value.trim()
+          reason: overlay.querySelector('#penReason').value.trim(),
+          source: 'manual'
         };
         var req = existing
           ? fetch('/penalties/' + existing.id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
           : fetch('/penalties', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-        req.then(function(r) { if (r.ok) { document.body.removeChild(overlay); refreshPenalties(); } else alert('Save failed'); })
-          .catch(function() { alert('Save failed'); });
+        req.then(function(r) { if (r.ok) { document.body.removeChild(overlay); refreshPenalties(); } else alert('Save failed'); });
       };
       overlay.onclick = function(ev) { if (ev.target === overlay) document.body.removeChild(overlay); };
     }
+    function runRecalculate() {
+      return fetch('/recalculate-penalties', { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+          var msg = 'Checked ' + (res.checked || 0) + ' car/legs · auto penalties: ' + (res.autoCount || 0);
+          if (res.message) msg += ' · ' + res.message;
+          var status = document.getElementById('penaltyStatus');
+          if (status) status.textContent = msg;
+          refreshPenalties();
+          refreshSchedulePreview();
+          return res;
+        });
+    }
     document.getElementById('addPenaltyBtn').onclick = function() { showPenaltyModal(null); };
+    document.getElementById('recalcPenaltiesBtn').onclick = function() { runRecalculate(); };
     document.getElementById('resetPenaltiesBtn').onclick = function() {
-      if (!confirm('Clear all penalties?')) return;
-      fetch('/reset-penalties', { method: 'POST' }).then(function(r) { if (r.ok) refreshPenalties(); });
+      if (!confirm('Clear automatic penalties? Manual penalties are kept.')) return;
+      fetch('/reset-penalties', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ autoOnly: true }) })
+        .then(function(r) { if (r.ok) refreshPenalties(); });
     };
     document.getElementById('penaltyList').addEventListener('click', function(ev) {
       var edit = ev.target.closest('.pen-edit');
@@ -373,6 +600,17 @@ def index():
 
     /* ---------- Itinerary ---------- */
     var lastItinerary = [];
+    function refreshLiveTcHints() {
+      var set = {};
+      lastData.forEach(function(e) {
+        var t = (e.tc != null && e.tc !== '') ? String(e.tc).trim() : '';
+        if (t) set[t] = true;
+      });
+      var names = Object.keys(set).sort();
+      document.getElementById('liveTcHints').textContent = names.length
+        ? ('TC names currently in Live Times: ' + names.join(', '))
+        : 'No TC names in live times yet.';
+    }
     function refreshItinerary() {
       fetch('/itinerary?t=' + Date.now())
         .then(function(r) { return r.json(); })
@@ -387,22 +625,26 @@ def index():
     function renderItinerary() {
       var el = document.getElementById('itineraryList');
       if (!lastItinerary.length) {
-        el.innerHTML = '<div class="empty">No itinerary items yet.</div>';
+        el.innerHTML = '<div class="empty">No itinerary yet. Add the start control (e.g. TC0), then the next TC with target minutes.</div>';
         return;
       }
       var rows = lastItinerary.map(function(item, i) {
+        var targetCell = i === 0
+          ? '<span class="muted">Start — no previous target</span>'
+          : ('<strong>' + escapeHtml(String(item.targetMinutesFromPrev != null ? item.targetMinutesFromPrev : '')) + ' min</strong> from ' + escapeHtml(lastItinerary[i-1].code || ''));
         return '<tr data-id="' + item.id + '">' +
           '<td class="muted">' + (i + 1) + '</td>' +
-          '<td>' + escapeHtml(item.code || '') + '</td>' +
+          '<td><strong>' + escapeHtml(item.code || '') + '</strong></td>' +
           '<td class="muted">' + escapeHtml(item.name || '') + '</td>' +
-          '<td>' + escapeHtml(item.distance || '') + '</td>' +
-          '<td>' + escapeHtml(item.targetTime || '') + '</td>' +
-          '<td class="muted">' + escapeHtml(item.notes || '') + '</td>' +
-          '<td class="actions"><button type="button" class="edit-btn it-edit" data-id="' + item.id + '">Edit</button> ' +
-          '<button type="button" class="delete-btn it-del" data-id="' + item.id + '">Delete</button></td>' +
-          '</tr>';
+          '<td>' + targetCell + '</td>' +
+          '<td class="actions">' +
+            '<button type="button" class="move-btn it-up" data-id="' + item.id + '" title="Move up">↑</button> ' +
+            '<button type="button" class="move-btn it-down" data-id="' + item.id + '" title="Move down">↓</button> ' +
+            '<button type="button" class="edit-btn it-edit" data-id="' + item.id + '">Edit</button> ' +
+            '<button type="button" class="delete-btn it-del" data-id="' + item.id + '">Delete</button>' +
+          '</td></tr>';
       }).join('');
-      el.innerHTML = '<table class="data"><thead><tr><th>#</th><th>Code</th><th>Name</th><th>Distance</th><th>Target</th><th>Notes</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
+      el.innerHTML = '<table class="data"><thead><tr><th>#</th><th>TC code</th><th>Name</th><th>Target from previous</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
     function findItinerary(id) {
       var n = parseInt(id, 10);
@@ -414,47 +656,100 @@ def index():
     function showItineraryModal(existing) {
       var overlay = document.createElement('div');
       overlay.className = 'modal-overlay';
-      var p = existing || { code: '', name: '', distance: '', targetTime: '', notes: '' };
+      var isFirst = !existing && lastItinerary.length === 0;
+      var p = existing || { code: isFirst ? 'TC0' : '', name: '', targetMinutesFromPrev: isFirst ? 0 : 50 };
+      var showTarget = existing ? (findItineraryIndex(existing.id) > 0) : !isFirst;
       overlay.innerHTML =
-        '<div class="modal"><h3 style="margin:0 0 12px 0;color:#ffb74d;">' + (existing ? 'Edit itinerary item' : 'Add itinerary item') + '</h3>' +
-        '<label>Code (e.g. TC1, SS2)</label><input type="text" id="itCode" value="' + escapeHtml(p.code || '') + '">' +
-        '<label>Name</label><input type="text" id="itName" value="' + escapeHtml(p.name || '') + '">' +
-        '<label>Distance (e.g. 12.4 km)</label><input type="text" id="itDist" value="' + escapeHtml(p.distance || '') + '">' +
-        '<label>Target time</label><input type="text" id="itTarget" value="' + escapeHtml(p.targetTime || '') + '">' +
-        '<label>Notes</label><textarea id="itNotes">' + escapeHtml(p.notes || '') + '</textarea>' +
+        '<div class="modal"><h3 style="margin:0 0 12px 0;color:#ffb74d;">' + (existing ? 'Edit time control' : 'Add time control') + '</h3>' +
+        '<label>TC code (must match Live Times, e.g. TC0, TC01, TC1)</label><input type="text" id="itCode" value="' + escapeHtml(p.code || '') + '">' +
+        '<label>Name (optional)</label><input type="text" id="itName" value="' + escapeHtml(p.name || '') + '">' +
+        (showTarget
+          ? '<label>Target minutes from previous TC</label><input type="number" id="itTargetMin" min="0" step="1" value="' + escapeHtml(String(p.targetMinutesFromPrev != null ? p.targetMinutesFromPrev : 50)) + '">'
+          : '<p class="hint" style="margin-top:12px;">This is the start control — cars get their start time when they punch here.</p><input type="hidden" id="itTargetMin" value="0">') +
         '<div class="modal-btns"><button type="button" class="cancel-btn">Cancel</button><button type="button" class="save-btn">Save</button></div></div>';
       document.body.appendChild(overlay);
       overlay.querySelector('.cancel-btn').onclick = function() { document.body.removeChild(overlay); };
       overlay.querySelector('.save-btn').onclick = function() {
+        var code = overlay.querySelector('#itCode').value.trim();
+        if (!code) { alert('TC code is required'); return; }
+        var mins = parseInt(overlay.querySelector('#itTargetMin').value, 10);
+        if (isNaN(mins) || mins < 0) mins = 0;
         var body = {
-          code: overlay.querySelector('#itCode').value.trim(),
+          code: code,
           name: overlay.querySelector('#itName').value.trim(),
-          distance: overlay.querySelector('#itDist').value.trim(),
-          targetTime: overlay.querySelector('#itTarget').value.trim(),
-          notes: overlay.querySelector('#itNotes').value.trim()
+          targetMinutesFromPrev: mins
         };
-        if (!body.code && !body.name) { alert('Enter at least a code or name'); return; }
         var req = existing
           ? fetch('/itinerary/' + existing.id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
           : fetch('/itinerary', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-        req.then(function(r) { if (r.ok) { document.body.removeChild(overlay); refreshItinerary(); } else alert('Save failed'); })
-          .catch(function() { alert('Save failed'); });
+        req.then(function(r) { if (r.ok) { document.body.removeChild(overlay); refreshItinerary(); refreshSchedulePreview(); } else alert('Save failed'); });
       };
       overlay.onclick = function(ev) { if (ev.target === overlay) document.body.removeChild(overlay); };
     }
+    function findItineraryIndex(id) {
+      for (var i = 0; i < lastItinerary.length; i++) {
+        if (lastItinerary[i].id == id) return i;
+      }
+      return -1;
+    }
+    function refreshSchedulePreview() {
+      fetch('/schedule-check?t=' + Date.now())
+        .then(function(r) { return r.json(); })
+        .then(function(rows) {
+          var el = document.getElementById('schedulePreview');
+          if (!rows || !rows.length) {
+            el.innerHTML = '<div class="empty">No matching car times for consecutive itinerary controls yet.</div>';
+            return;
+          }
+          var html = rows.map(function(r) {
+            var badge = r.kind === 'late' ? '<span class="badge badge-late">LATE ' + r.minutes + 'm</span>'
+              : r.kind === 'early' ? '<span class="badge badge-early">EARLY ' + r.minutes + 'm</span>'
+              : '<span class="badge badge-ok">OK</span>';
+            return '<tr>' +
+              '<td>#' + escapeHtml(String(r.carNumber)) + '</td>' +
+              '<td class="muted">' + escapeHtml(r.fromTc) + ' → ' + escapeHtml(r.toTc) + '</td>' +
+              '<td class="muted">' + escapeHtml(String(r.targetMinutes)) + ' min</td>' +
+              '<td>' + escapeHtml(r.prevTime) + '</td>' +
+              '<td>' + escapeHtml(r.targetTime) + '</td>' +
+              '<td>' + escapeHtml(r.actualTime) + '</td>' +
+              '<td>' + badge + '</td>' +
+              '<td>' + (r.kind === 'ok' ? '—' : escapeHtml(r.penalty)) + '</td>' +
+              '</tr>';
+          }).join('');
+          el.innerHTML = '<table class="data"><thead><tr><th>Car</th><th>Leg</th><th>Target</th><th>Prev punch</th><th>Due</th><th>Actual</th><th>Status</th><th>Penalty</th></tr></thead><tbody>' + html + '</tbody></table>';
+        })
+        .catch(function() {
+          document.getElementById('schedulePreview').innerHTML = '<div class="empty">Could not load schedule check.</div>';
+        });
+    }
     document.getElementById('addItineraryBtn').onclick = function() { showItineraryModal(null); };
+    document.getElementById('recalcFromItineraryBtn').onclick = function() {
+      runRecalculate().then(function() { showTab('penalties'); });
+    };
     document.getElementById('resetItineraryBtn').onclick = function() {
       if (!confirm('Clear the whole itinerary?')) return;
-      fetch('/reset-itinerary', { method: 'POST' }).then(function(r) { if (r.ok) refreshItinerary(); });
+      fetch('/reset-itinerary', { method: 'POST' }).then(function(r) { if (r.ok) { refreshItinerary(); refreshSchedulePreview(); } });
     };
     document.getElementById('itineraryList').addEventListener('click', function(ev) {
       var edit = ev.target.closest('.it-edit');
       if (edit) { var item = findItinerary(edit.getAttribute('data-id')); if (item) showItineraryModal(item); return; }
       var del = ev.target.closest('.it-del');
       if (del) {
-        if (!confirm('Delete this itinerary item?')) return;
+        if (!confirm('Delete this time control?')) return;
         fetch('/itinerary/' + del.getAttribute('data-id'), { method: 'DELETE' })
-          .then(function(r) { if (r.ok) refreshItinerary(); });
+          .then(function(r) { if (r.ok) { refreshItinerary(); refreshSchedulePreview(); } });
+        return;
+      }
+      var up = ev.target.closest('.it-up');
+      if (up) {
+        fetch('/itinerary/' + up.getAttribute('data-id') + '/move', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ direction: 'up' }) })
+          .then(function(r) { if (r.ok) { refreshItinerary(); refreshSchedulePreview(); } });
+        return;
+      }
+      var down = ev.target.closest('.it-down');
+      if (down) {
+        fetch('/itinerary/' + down.getAttribute('data-id') + '/move', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ direction: 'down' }) })
+          .then(function(r) { if (r.ok) { refreshItinerary(); refreshSchedulePreview(); } });
       }
     });
 
@@ -489,6 +784,8 @@ def add_entry():
     entry = {"id": _next_entry_id, "time": time, "carNumber": car_number, "tc": tc}
     _next_entry_id += 1
     entries.insert(0, entry)
+    # Keep penalties fresh when new punches arrive
+    recalculate_auto_penalties()
     return jsonify({"ok": True, "id": entry["id"]}), 201
 
 
@@ -507,6 +804,7 @@ def update_entry(entry_id):
             pass
     if "tc" in data:
         entry["tc"] = str(data["tc"])
+    recalculate_auto_penalties()
     return jsonify({"ok": True}), 200
 
 
@@ -516,6 +814,7 @@ def delete_entry(entry_id):
     for i, e in enumerate(entries):
         if e.get("id") == entry_id:
             entries.pop(i)
+            recalculate_auto_penalties()
             return jsonify({"ok": True}), 200
     return jsonify({"error": "Not found"}), 404
 
@@ -524,6 +823,7 @@ def delete_entry(entry_id):
 def reset_entries():
     global entries
     entries.clear()
+    recalculate_auto_penalties()
     return jsonify({"ok": True}), 200
 
 
@@ -549,6 +849,8 @@ def add_penalty():
         "penalty": str(data.get("penalty") or ""),
         "tc": str(data.get("tc") or ""),
         "reason": str(data.get("reason") or ""),
+        "kind": str(data.get("kind") or "manual"),
+        "source": str(data.get("source") or "manual"),
     }
     _next_penalty_id += 1
     penalties.append(item)
@@ -560,6 +862,8 @@ def update_penalty(penalty_id):
     item = next((p for p in penalties if p.get("id") == penalty_id), None)
     if item is None:
         return jsonify({"error": "Not found"}), 404
+    if item.get("source") == "auto":
+        return jsonify({"error": "Auto penalties are managed by recalculate"}), 400
     data = request.get_json(force=True, silent=True) or {}
     if "carNumber" in data:
         try:
@@ -572,6 +876,7 @@ def update_penalty(penalty_id):
         item["tc"] = str(data["tc"])
     if "reason" in data:
         item["reason"] = str(data["reason"])
+    item["source"] = "manual"
     return jsonify({"ok": True}), 200
 
 
@@ -586,8 +891,19 @@ def delete_penalty(penalty_id):
 
 @app.route("/reset-penalties", methods=["POST"])
 def reset_penalties():
-    penalties.clear()
+    global penalties
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get("autoOnly"):
+        penalties[:] = [p for p in penalties if p.get("source") != "auto"]
+    else:
+        penalties.clear()
     return jsonify({"ok": True}), 200
+
+
+@app.route("/recalculate-penalties", methods=["POST"])
+def recalculate_penalties_route():
+    result = recalculate_auto_penalties()
+    return jsonify(result), 200
 
 
 # ---------- Itinerary ----------
@@ -602,16 +918,24 @@ def get_itinerary():
 def add_itinerary():
     global _next_itinerary_id
     data = request.get_json(force=True, silent=True) or {}
+    try:
+        mins = int(data.get("targetMinutesFromPrev", 0))
+    except (TypeError, ValueError):
+        mins = 0
+    if mins < 0:
+        mins = 0
+    # First control is always start (0 minutes from previous)
+    if not itinerary:
+        mins = 0
     item = {
         "id": _next_itinerary_id,
-        "code": str(data.get("code") or ""),
+        "code": normalize_tc(data.get("code")),
         "name": str(data.get("name") or ""),
-        "distance": str(data.get("distance") or ""),
-        "targetTime": str(data.get("targetTime") or ""),
-        "notes": str(data.get("notes") or ""),
+        "targetMinutesFromPrev": mins,
     }
     _next_itinerary_id += 1
     itinerary.append(item)
+    recalculate_auto_penalties()
     return jsonify({"ok": True, "id": item["id"]}), 201
 
 
@@ -621,9 +945,20 @@ def update_itinerary(item_id):
     if item is None:
         return jsonify({"error": "Not found"}), 404
     data = request.get_json(force=True, silent=True) or {}
-    for key in ("code", "name", "distance", "targetTime", "notes"):
-        if key in data:
-            item[key] = str(data[key])
+    if "code" in data:
+        item["code"] = normalize_tc(data["code"])
+    if "name" in data:
+        item["name"] = str(data["name"])
+    if "targetMinutesFromPrev" in data:
+        try:
+            mins = int(data["targetMinutesFromPrev"])
+        except (TypeError, ValueError):
+            mins = 0
+        if mins < 0:
+            mins = 0
+        idx = next(i for i, x in enumerate(itinerary) if x.get("id") == item_id)
+        item["targetMinutesFromPrev"] = 0 if idx == 0 else mins
+    recalculate_auto_penalties()
     return jsonify({"ok": True}), 200
 
 
@@ -632,14 +967,77 @@ def delete_itinerary(item_id):
     for i, item in enumerate(itinerary):
         if item.get("id") == item_id:
             itinerary.pop(i)
+            if itinerary:
+                itinerary[0]["targetMinutesFromPrev"] = 0
+            recalculate_auto_penalties()
             return jsonify({"ok": True}), 200
     return jsonify({"error": "Not found"}), 404
+
+
+@app.route("/itinerary/<int:item_id>/move", methods=["POST"])
+def move_itinerary(item_id):
+    data = request.get_json(force=True, silent=True) or {}
+    direction = str(data.get("direction") or "")
+    idx = next((i for i, x in enumerate(itinerary) if x.get("id") == item_id), None)
+    if idx is None:
+        return jsonify({"error": "Not found"}), 404
+    if direction == "up" and idx > 0:
+        itinerary[idx - 1], itinerary[idx] = itinerary[idx], itinerary[idx - 1]
+    elif direction == "down" and idx < len(itinerary) - 1:
+        itinerary[idx + 1], itinerary[idx] = itinerary[idx], itinerary[idx + 1]
+    else:
+        return jsonify({"ok": True}), 200
+    if itinerary:
+        itinerary[0]["targetMinutesFromPrev"] = 0
+    recalculate_auto_penalties()
+    return jsonify({"ok": True}), 200
 
 
 @app.route("/reset-itinerary", methods=["POST"])
 def reset_itinerary():
     itinerary.clear()
+    recalculate_auto_penalties()
     return jsonify({"ok": True}), 200
+
+
+@app.route("/schedule-check")
+def schedule_check():
+    """Preview target vs actual for every car on every itinerary leg."""
+    rows = []
+    if len(itinerary) < 2:
+        return jsonify(rows)
+    cars = sorted({int(e.get("carNumber", 0)) for e in entries})
+    for i in range(1, len(itinerary)):
+        prev = itinerary[i - 1]
+        curr = itinerary[i]
+        prev_code = normalize_tc(prev.get("code"))
+        curr_code = normalize_tc(curr.get("code"))
+        try:
+            target_minutes = int(curr.get("targetMinutesFromPrev") or 0)
+        except (TypeError, ValueError):
+            target_minutes = 0
+        for car in cars:
+            prev_t = official_time_for_car_tc(car, prev_code)
+            curr_t = official_time_for_car_tc(car, curr_code)
+            if prev_t is None or curr_t is None:
+                continue
+            result = compute_leg_penalty(prev_t, curr_t, target_minutes)
+            rows.append({
+                "carNumber": car,
+                "fromTc": prev_code,
+                "toTc": curr_code,
+                "targetMinutes": target_minutes,
+                "prevTime": format_clock(prev_t),
+                "targetTime": result["targetTime"],
+                "actualTime": result["actualTime"],
+                "kind": result["kind"],
+                "minutes": result["minutes"],
+                "penalty": result["penalty"],
+                "reason": result["reason"],
+            })
+    r = jsonify(rows)
+    r.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    return r
 
 
 @app.route("/health")
